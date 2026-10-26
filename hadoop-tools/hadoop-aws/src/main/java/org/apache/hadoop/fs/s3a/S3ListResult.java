@@ -93,6 +93,33 @@ public class S3ListResult {
     }
   }
 
+  /**
+   * Whether the store set {@code IsTruncated} to true.
+   * A missing (null) flag is treated as false so callers can decide
+   * whether to page without an NPE; {@link #isTruncated()} still unboxes.
+   * @return true only when the listing is explicitly truncated
+   */
+  public boolean isTruncatedTrue() {
+    return Boolean.TRUE.equals(isV1()
+        ? v1Result.isTruncated()
+        : v2Result.isTruncated());
+  }
+
+  /**
+   * Token for the next listing page.
+   * V2: {@code NextContinuationToken}; V1: {@code NextMarker}.
+   * Does not fall back to the last object key, so an empty truncated
+   * page without a token is detectable.
+   * @return continuation token, or null if the store omitted one
+   */
+  public String getNextContinuationToken() {
+    if (isV1()) {
+      return v1Result.nextMarker();
+    } else {
+      return v2Result.nextContinuationToken();
+    }
+  }
+
   public List<CommonPrefix> getCommonPrefixes() {
     if (isV1()) {
       return v1Result.commonPrefixes();

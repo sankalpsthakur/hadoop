@@ -357,6 +357,13 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
   /** Log to warn of storage class configuration problems. */
   private static final LogExactlyOnce STORAGE_CLASS_WARNING = new LogExactlyOnce(LOG);
 
+  /**
+   * Warn once if a truncated LIST page has no continuation token
+   * (HADOOP-20036).
+   */
+  private static final LogExactlyOnce TRUNCATED_LIST_WITHOUT_TOKEN =
+      new LogExactlyOnce(LOG);
+
   private String cannedACL;
 
   /**
@@ -3994,6 +4001,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
    *   <li>
    *     DirMarker/List: issue a LIST on the key (with / if needed), require one
    *     entry to be found for the path to be considered a non-empty directory.
+   *     Empty truncated pages are followed via continuation tokens
+   *     (HADOOP-20036).
    *   </li>
    * </ol>
    *
@@ -4084,6 +4093,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
         // execute the request
         S3ListResult listResult = listObjects(request,
             getDurationTrackerFactory());
+        // S3 may return an empty page with IsTruncated=true (HADOOP-20036).
+        listResult = continueEmptyTruncatedListing(request, listResult);
 
         if (listResult.hasPrefixesOrObjects()) {
           if (LOG.isDebugEnabled()) {
@@ -4116,6 +4127,40 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities,
 
     LOG.debug("Not Found: {}", path);
     throw new FileNotFoundException("No such file or directory: " + path);
+  }
+
+  /**
+   * Follow ListObjects continuation while the page is empty and truncated.
+   * S3 ListObjectsV2 may legally return no keys with {@code IsTruncated=true}
+   * and a {@code NextContinuationToken} (HADOOP-20036). Without following
+   * that token, {@link #s3GetFileStatus} treats a non-empty directory as
+   * missing.
+   * Continues only on an explicit truncated flag and a V2 continuation
+   * token or V1 next-marker; otherwise keeps the current page.
+   * @param request original list request
+   * @param listResult first (or current) page
+   * @return first page that has prefixes/objects, or the last page if
+   * the listing is complete or cannot be continued
+   * @throws IOException from the continued LIST
+   */
+  @Retries.RetryRaw
+  private S3ListResult continueEmptyTruncatedListing(
+      S3ListRequest request,
+      S3ListResult listResult) throws IOException {
+    while (!listResult.hasPrefixesOrObjects()
+        && listResult.isTruncatedTrue()) {
+      String token = listResult.getNextContinuationToken();
+      if (token == null || token.isEmpty()) {
+        TRUNCATED_LIST_WITHOUT_TOKEN.warn(
+            "LIST of {} was truncated but returned no continuation token;"
+                + " treating the listing as complete", request);
+        break;
+      }
+      LOG.debug("Empty truncated LIST page for {}; continuing", request);
+      listResult = continueListObjects(request, listResult,
+          getDurationTrackerFactory());
+    }
+    return listResult;
   }
 
   /**

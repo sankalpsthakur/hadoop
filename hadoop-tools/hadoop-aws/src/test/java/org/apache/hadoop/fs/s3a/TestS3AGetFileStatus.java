@@ -21,6 +21,8 @@ package org.apache.hadoop.fs.s3a;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.io.FileNotFoundException;
@@ -110,6 +112,46 @@ public class TestS3AGetFileStatus extends AbstractS3AMockTest {
     assertTrue(stat.toString().contains("isErasureCoded=false"),
         path + " should have erasure coding unset in " +
         "FileStatus#toString(): " + stat);
+  }
+
+  /**
+   * HADOOP-20036: ListObjectsV2 may return an empty truncated page.
+   * getFileStatus must follow NextContinuationToken rather than treating
+   * the empty page as a missing directory.
+   */
+  @Test
+  public void testImplicitDirectoryAfterEmptyTruncatedListPage()
+      throws Exception {
+    Path path = new Path("/dir");
+    String key = path.toUri().getPath().substring(1);
+    when(s3.headObject(argThat(correctGetMetadataRequest(BUCKET, key))))
+        .thenThrow(NOT_FOUND);
+    String keyDir = key + "/";
+    ListObjectsV2Response emptyTruncated = ListObjectsV2Response.builder()
+        .contents(Collections.emptyList())
+        .commonPrefixes(Collections.emptyList())
+        .isTruncated(true)
+        .keyCount(0)
+        .nextContinuationToken("next-page")
+        .build();
+    ListObjectsV2Response withChild = ListObjectsV2Response.builder()
+        .contents(Collections.singletonList(
+            S3Object.builder().key(keyDir + "file").size(1L).build()))
+        .isTruncated(false)
+        .keyCount(1)
+        .build();
+    when(s3.listObjectsV2(any(ListObjectsV2Request.class)))
+        .thenReturn(emptyTruncated, withChild);
+
+    FileStatus stat = fs.getFileStatus(path);
+
+    assertNotNull(stat);
+    assertEquals(fs.makeQualified(path), stat.getPath());
+    assertTrue(stat.isDirectory());
+    verify(s3, times(2)).listObjectsV2(any(ListObjectsV2Request.class));
+    verify(s3).listObjectsV2(argThat((ListObjectsV2Request request) ->
+        request != null
+            && "next-page".equals(request.continuationToken())));
   }
 
   @Test
